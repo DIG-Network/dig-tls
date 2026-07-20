@@ -12,7 +12,7 @@
 # (a same-level L00 crate). The caller passes its BLS identity secret key in.
 [package]
 name = "dig-tls"
-version = "0.0.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.81.0"
 license = "Apache-2.0 OR MIT"
@@ -42,6 +42,10 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem",
 # the BLS binding) — the same crate rcgen re-exports for inspection.
 x509-parser = "0.16"
 sha2 = "0.10"
+# PEM <-> DER conversion for the embedded CA cert (trust anchor) and persisted node-cert material.
+rustls-pemfile = "2"
+# Certificate validity windows (not_before/not_after) for the CA and the per-peer leaves.
+time = { version = "0.3", features = ["macros"] }
 
 # The node/relay BLS12-381 G1 identity crypto — BLS-G2 sign/verify under the Chia AugScheme, done on
 # RAW bytes so dig-tls needs no DIG-crate dependency. dig-identity itself delegates to this exact
@@ -66,6 +70,8 @@ tracing = "0.1"
 # accepted, one that is NOT is rejected, and the BLS binding round-trips.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# Persisted-cert round-trip tests write to a throwaway directory.
+tempfile = "3"
 
 [profile.release]
 overflow-checks = true
