@@ -5,7 +5,9 @@
 //! but dig-identity is a same-level L00 crate — dig-tls cannot depend on it (reference-DOWN-only,
 //! Appendix B). So dig-tls re-implements the two operations it needs directly against the SAME vetted
 //! backend dig-identity uses (`chia-bls` for AugScheme sign/verify, `blst` for the G1 subgroup check).
-//! A cross-crate conformance test pins that the derivation byte-agrees so the two can never drift.
+//! Byte-agreement with dig-identity rests on both crates sharing the same `chia-bls`/`blst` backend;
+//! dig-tls (L00) cannot itself depend on dig-identity to pin this directly, so the cross-crate
+//! conformance check lives at the higher adoption/integration level where both are in scope.
 //!
 //! Every function here is fail-closed on malformed input and takes/returns fixed-size byte arrays:
 //! a 48-byte compressed G1 public key and a 96-byte compressed G2 signature.

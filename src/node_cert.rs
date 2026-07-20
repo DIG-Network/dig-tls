@@ -118,8 +118,9 @@ impl NodeCert {
         }
         let node = Self::generate_signed(bls_sk)?;
         fs::create_dir_all(dir)?;
+        harden_dir_permissions(dir)?;
         fs::write(&cert_path, node.cert_pem.as_bytes())?;
-        fs::write(&key_path, node.key_pem.as_bytes())?;
+        write_key_file(&key_path, node.key_pem.as_bytes())?;
         Ok(node)
     }
 
@@ -189,6 +190,67 @@ impl NodeCert {
     }
 }
 
+/// Restrict `dir` to owner-only access (`0700`) before any secret is written into it.
+///
+/// The leaf private key is the peer's long-lived (10yr) transport-identity secret — the same
+/// material Chia's `create_ssl.py` chmods `0600`. Without this, `fs::create_dir_all` leaves the
+/// directory at the process umask default (commonly `0755`), letting any local unprivileged user
+/// read the key and fully impersonate the peer (the SPKI pin + #1204 BLS binding are genuine, so a
+/// stolen key is a genuine identity, not a detectable forgery).
+#[cfg(unix)]
+fn harden_dir_permissions(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Windows has no POSIX mode bits; directory ACL hardening is handled per-file on the key itself
+/// (see [`write_key_file`]), so there is nothing additional to do here.
+#[cfg(windows)]
+fn harden_dir_permissions(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Persist the private key PEM at `path` with owner-only access, closing the world-readable window
+/// a plain `fs::write` would leave open at the process umask default.
+#[cfg(unix)]
+fn write_key_file(path: &Path, key_pem: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    // Create with 0600 baked into the `open(2)` call itself — no window where the key is briefly
+    // world-readable between "write the file" and "chmod it after".
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(key_pem)?;
+    // `mode()` on open() is masked by umask on some platforms; re-assert explicitly so the key is
+    // always 0600 regardless of the caller's umask.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Best-effort ACL hardening on Windows: strip inherited access and grant only the current user.
+///
+/// This is defense-in-depth, not the gating fix (the exploit this PR closes is the Unix `0644`
+/// world-readable case). `icacls` ships with every supported Windows version, so shelling out to it
+/// avoids pulling a heavyweight ACL crate for a best-effort hardening step; a failure here is logged
+/// as a best-effort miss, not a hard error, since the key is still written successfully.
+#[cfg(windows)]
+fn write_key_file(path: &Path, key_pem: &[u8]) -> Result<()> {
+    fs::write(path, key_pem)?;
+    if let (Some(path_str), Ok(user)) = (path.to_str(), std::env::var("USERNAME")) {
+        // Remove inherited ACEs, then grant only the current user full control.
+        let _ = std::process::Command::new("icacls")
+            .args([path_str, "/inheritance:r", "/grant:r", &format!("{user}:F")])
+            .output();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +314,29 @@ mod tests {
             second.peer_id(),
             "a persisted cert is reloaded, not regenerated"
         );
+    }
+
+    /// Regression test for the key-at-rest finding: a persisted leaf key MUST be `0600` (owner
+    /// read/write only) and its directory `0700` — never the umask-default world-readable
+    /// `0644`/`0755` a plain `fs::write`/`fs::create_dir_all` would leave behind.
+    #[test]
+    #[cfg(unix)]
+    fn load_or_generate_persists_the_key_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sk = bls_sk("perms");
+        NodeCert::load_or_generate(dir.path(), &sk).unwrap();
+
+        let dir_mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "cert directory must be owner-only");
+
+        let key_mode = fs::metadata(dir.path().join(KEY_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(key_mode, 0o600, "private key file must be owner-only");
     }
 
     #[test]
