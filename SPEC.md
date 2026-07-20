@@ -39,6 +39,41 @@ the signing context, the `peer_id` derivation) MUST NOT drift; they are recorded
 - Only the leaf is sent on the wire; the DigNetwork CA is a well-known embedded anchor, never
   transmitted.
 
+### 2.1 Machine-key rotation
+
+Because `peer_id = SHA-256(SPKI DER)` and the SPKI commits the BLS binding (§4), replacing the key
+pair MUST change the `peer_id` — rotation is an IDENTITY change, not a cert renewal. dig-tls is a
+library and MUST NOT perform networking; it provides only the rotation PRIMITIVE and the caller
+orchestrates the network overlap and re-announce.
+
+- `rotate(dir, new_bls_sk)` mints a fresh `(TLS leaf, cert)` bound to the caller-supplied new BLS
+  identity secret, and returns BOTH the retiring (`previous`) and the freshly minted (`current`)
+  identity so the caller can dual-present — accept inbound on the old `peer_id` while it re-announces
+  the new `peer_id` — during the overlap window. dig-tls never derives or stores a BLS key; the new
+  identity secret is minted by the caller (dig-identity) and passed in, mirroring `generate_signed`.
+- Persistence is ADDITIVE (§5.1 back-compat): the current identity always stays in `node.crt` /
+  `node.key`; the retiring identity is written to NEW `node.crt.prev` / `node.key.prev` files. A
+  reader that predates rotation still loads a single-cert directory unchanged, and `load_previous`
+  reports no previous identity for such a directory. Key files stay owner-only (`0600`).
+- All persisted slot writes (current AND `.prev`, both `rotate` and `load_or_generate`) are ATOMIC and
+  durable: the bytes are staged to a sibling `<name>.tmp`, fsynced, atomically renamed over the target,
+  and the parent directory is fsynced. A crash at any point therefore leaves EITHER the intact prior
+  contents or the intact new contents of a slot — never a torn or truncated half-write. A secret key's
+  `.tmp` is created owner-only (`0600`) so key material is never briefly world-readable even while staged.
+- `rotate` refuses (returns an error, leaving disk untouched) when a `.prev` slot is already present:
+  an un-retired previous identity means a prior rotation is still mid-overlap, so the caller MUST
+  `retire_previous` before rotating again — one `.prev` generation exists at a time and an in-overlap
+  identity is never silently overwritten.
+- `from_pem` / `from_parts` enforce cert⇔key consistency: a loaded certificate MUST certify the SAME
+  public key the private key holds (SubjectPublicKeyInfo DER equal). A mismatched cert+key pair is
+  REJECTED (a `Parse` error), never loaded — so a peer never pins a `peer_id` for a key its presented
+  certificate does not carry.
+- `load_previous(dir)` reloads the `.prev` identity after a restart that happened mid-overlap;
+  `retire_previous(dir)` zeroizes the in-memory copy of the old key and deletes both `.prev` files
+  once the caller's re-announce has converged (a no-op when no `.prev` slot exists).
+- Cert-EXPIRY renewal under the SAME key (same `peer_id`, new validity window) is a SEPARATE, cheaper
+  path and is not the concern of `rotate`.
+
 ## 3. peer_id — canonical transport identity
 
 `peer_id = SHA-256(TLS SubjectPublicKeyInfo DER)`, where the SPKI is the full ASN.1

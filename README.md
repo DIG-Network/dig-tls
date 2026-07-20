@@ -24,6 +24,8 @@ presents the same canonical cert shape.
 | `NodeCert::generate_signed(bls_sk)` | Mint this peer's cert, signed by the shipped DigNetwork CA. |
 | `NodeCert::load_or_generate(dir, bls_sk)` | Load a persisted cert or generate + persist a new one. |
 | `NodeCert::peer_id()` / `spki_der()` / `cert_der()` / `cert_pem()` | Identity + material accessors. |
+| `NodeCert::rotate(dir, new_bls_sk) -> RotatedNodeCert` | Mint a fresh identity (new `peer_id`) bound to a new BLS key; keeps the old in a `.prev` slot so the caller can dual-present. |
+| `load_previous(dir)` / `retire_previous(dir)` | Reload the retiring identity after a restart; zeroize + delete it once re-announce converges. |
 | `config::server_config(node, policy) -> ServerTls` | Inbound rustls mTLS config + capture handles. |
 | `config::client_config(node, expected, policy) -> ClientTls` | Outbound config (pins `expected`). |
 | `BindingPolicy` | `Off` / `Opportunistic` (default) / `Required` (fail-closed) for the BLS binding. |

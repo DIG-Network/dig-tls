@@ -10,7 +10,7 @@
 //! so a peer keeps a stable `peer_id` across restarts.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, Ia5String, KeyPair,
@@ -39,6 +39,47 @@ const LEAF_SAN: &str = "peer.dig";
 /// The on-disk file names for the persisted node cert + key.
 const CERT_FILE: &str = "node.crt";
 const KEY_FILE: &str = "node.key";
+
+/// The on-disk file names for the RETIRING (previous) cert + key, written by [`NodeCert::rotate`] and
+/// deleted by [`retire_previous`]. These are NEW, additive files — the current identity always stays
+/// in [`CERT_FILE`]/[`KEY_FILE`], so a reader that predates rotation still loads unchanged (§5.1).
+const CERT_FILE_PREV: &str = "node.crt.prev";
+const KEY_FILE_PREV: &str = "node.key.prev";
+
+/// The outcome of a machine-key rotation ([`NodeCert::rotate`]): the retiring `previous` identity and
+/// the freshly minted `current` one.
+///
+/// Because `peer_id = SHA-256(SPKI DER)` and the SPKI commits the BLS binding, a rotation mints a
+/// brand-new key pair and therefore a brand-new `peer_id` — this is an IDENTITY CHANGE, not a cert
+/// renewal. dig-tls is a library and does NOT do networking; it hands back BOTH identities so the
+/// CALLER (dig-node) can dual-present — keep accepting inbound on the old `peer_id` while it
+/// re-announces the new `peer_id` to DHT/PEX/relay — then call [`retire_previous`] once the
+/// re-announce converges.
+///
+/// The derived `Debug` renders only each identity's redacting [`NodeCert`] `Debug` — never key bytes.
+#[derive(Debug)]
+pub struct RotatedNodeCert {
+    previous: NodeCert,
+    current: NodeCert,
+}
+
+impl RotatedNodeCert {
+    /// The retiring identity. Present it (and accept inbound on its `peer_id`) during the overlap
+    /// window, until the caller's re-announce converges and it calls [`retire_previous`].
+    pub fn previous(&self) -> &NodeCert {
+        &self.previous
+    }
+
+    /// The freshly minted identity to advertise going forward.
+    pub fn current(&self) -> &NodeCert {
+        &self.current
+    }
+
+    /// Consume the rotation, keeping only the new current identity (drops + scrubs the previous key).
+    pub fn into_current(self) -> NodeCert {
+        self.current
+    }
+}
 
 /// A peer's mTLS identity certificate + private key, plus its derived `peer_id`.
 ///
@@ -102,7 +143,11 @@ impl NodeCert {
             .signed_by(&leaf_key, &ca.cert, &ca.key)
             .map_err(|e| DigTlsError::CertGen(format!("sign leaf: {e}")))?;
 
-        Self::from_parts(cert.pem(), leaf_key.serialize_pem(), &leaf_key)
+        Self::from_parts(
+            cert.pem(),
+            Zeroizing::new(leaf_key.serialize_pem()),
+            &leaf_key,
+        )
     }
 
     /// Load a persisted node cert + key from `dir`, or generate + persist a new one signed by the
@@ -113,26 +158,99 @@ impl NodeCert {
         let key_path = dir.join(KEY_FILE);
         if cert_path.exists() && key_path.exists() {
             let cert_pem = fs::read_to_string(&cert_path)?;
-            let key_pem = fs::read_to_string(&key_path)?;
+            let key_pem = read_key_to_zeroizing(&key_path)?;
             return Self::from_pem(&cert_pem, &key_pem);
         }
         let node = Self::generate_signed(bls_sk)?;
         fs::create_dir_all(dir)?;
         harden_dir_permissions(dir)?;
-        fs::write(&cert_path, node.cert_pem.as_bytes())?;
-        write_key_file(&key_path, node.key_pem.as_bytes())?;
+        atomic_write(&cert_path, node.cert_pem.as_bytes(), Secret::No)?;
+        atomic_write(&key_path, node.key_pem.as_bytes(), Secret::Yes)?;
         Ok(node)
+    }
+
+    /// Rotate this peer's machine key: mint a FRESH `(TLS leaf, cert)` bound to `new_bls_sk`, persist
+    /// it as the new current identity, and demote the existing on-disk pair to the additive `.prev`
+    /// slot — WITHOUT losing it — so the caller can dual-present during the overlap window.
+    ///
+    /// The new leaf key means a new SPKI and therefore a new `peer_id`: rotation is an IDENTITY
+    /// CHANGE (see [`RotatedNodeCert`]). The caller mints the new BLS identity secret in dig-identity
+    /// and passes it in here; dig-tls never derives or stores a BLS key (mirroring
+    /// [`Self::generate_signed`]). Cert-EXPIRY renewal under the SAME key is a separate, cheaper path
+    /// — reissue with [`Self::generate_signed`] using the existing BLS secret; the `peer_id` is
+    /// preserved only when the SAME TLS leaf key is reused, which this rotation deliberately is NOT.
+    ///
+    /// The existing `dir` MUST already hold a current cert + key (rotation replaces a live identity).
+    /// The persisted key files stay owner-only `0600` (see [`write_key_file`]).
+    pub fn rotate(dir: impl AsRef<Path>, new_bls_sk: &SecretKey) -> Result<RotatedNodeCert> {
+        let dir = dir.as_ref();
+        let cert_path = dir.join(CERT_FILE);
+        let key_path = dir.join(KEY_FILE);
+        if !cert_path.exists() || !key_path.exists() {
+            return Err(DigTlsError::CertGen(
+                "rotate: no current node cert to rotate (call load_or_generate first)".into(),
+            ));
+        }
+
+        // Refuse to rotate while a prior rotation is still un-retired: a populated `.prev` slot means
+        // an identity is mid-overlap. Overwriting it would silently DISCARD that in-flight retiring
+        // identity (the caller may still be accepting inbound on its peer_id), so require the caller to
+        // `retire_previous` first — one `.prev` generation at a time.
+        let prev_cert_path = dir.join(CERT_FILE_PREV);
+        let prev_key_path = dir.join(KEY_FILE_PREV);
+        if prev_cert_path.exists() || prev_key_path.exists() {
+            return Err(DigTlsError::CertGen(
+                "rotate: a previous rotation is still un-retired (.prev slot present); \
+                 call retire_previous before rotating again"
+                    .into(),
+            ));
+        }
+
+        // Load the identity being retired BEFORE touching disk, so a mid-rotation failure never
+        // loses the live key: the caller still holds it in the returned `previous`.
+        let previous = {
+            let cert_pem = fs::read_to_string(&cert_path)?;
+            let key_pem = read_key_to_zeroizing(&key_path)?;
+            Self::from_pem(&cert_pem, &key_pem)?
+        };
+
+        // Mint the fresh identity (new leaf key ⇒ new SPKI ⇒ new peer_id) bound to the caller's new
+        // BLS secret. Generate it in full BEFORE any file write, so a generation error leaves the
+        // on-disk current identity untouched.
+        let current = Self::generate_signed(new_bls_sk)?;
+
+        // Persist the retiring pair into the additive `.prev` slot FIRST (so the old key is durable in
+        // two places), THEN atomically replace the current slot. Each `atomic_write` writes a sibling
+        // `.tmp`, fsyncs it, renames it over the target (an atomic same-dir replace), and fsyncs the
+        // parent dir — so a crash at any point leaves EITHER the intact old current or the intact new
+        // one in `node.crt`/`node.key`, never a torn/truncated half-write of either.
+        harden_dir_permissions(dir)?;
+        atomic_write(&prev_cert_path, previous.cert_pem.as_bytes(), Secret::No)?;
+        atomic_write(&prev_key_path, previous.key_pem.as_bytes(), Secret::Yes)?;
+        atomic_write(&cert_path, current.cert_pem.as_bytes(), Secret::No)?;
+        atomic_write(&key_path, current.key_pem.as_bytes(), Secret::Yes)?;
+
+        Ok(RotatedNodeCert { previous, current })
     }
 
     /// Reconstruct a [`NodeCert`] from persisted PEM (its cert + private key).
     pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self> {
         let key = KeyPair::from_pem(key_pem)
             .map_err(|e| DigTlsError::Parse(format!("parse leaf key: {e}")))?;
-        Self::from_parts(cert_pem.to_string(), key_pem.to_string(), &key)
+        Self::from_parts(
+            cert_pem.to_string(),
+            Zeroizing::new(key_pem.to_string()),
+            &key,
+        )
     }
 
     /// Assemble a [`NodeCert`] from its PEM parts, deriving the DER forms + `peer_id` once.
-    fn from_parts(cert_pem: String, key_pem: String, key: &KeyPair) -> Result<Self> {
+    ///
+    /// Enforces cert⇔key consistency: the certificate MUST certify the SAME public key the private key
+    /// holds (SPKI DER equal). A mismatched pair — a cert paired with the wrong key on disk, or a
+    /// half-completed swap of one slot but not the other — is REJECTED rather than loaded, so a peer
+    /// never presents a cert it cannot prove possession of.
+    fn from_parts(cert_pem: String, key_pem: Zeroizing<String>, key: &KeyPair) -> Result<Self> {
         let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
             .next()
             .and_then(|r| r.ok())
@@ -140,10 +258,23 @@ impl NodeCert {
             .to_vec();
         let key_der = key.serialize_der();
         let spki_der = key.public_key_der();
+
+        // The cert must certify this exact key: compare the cert's SubjectPublicKeyInfo DER to the
+        // key's own SPKI DER. peer_id is derived from the KEY's SPKI, so a silent mismatch would pin a
+        // peer_id the presented cert does not actually carry.
+        let (_, x509) = x509_parser::parse_x509_certificate(&cert_der)
+            .map_err(|e| DigTlsError::Parse(format!("leaf certificate is not valid X.509: {e}")))?;
+        if x509.tbs_certificate.subject_pki.raw != spki_der.as_slice() {
+            return Err(DigTlsError::Parse(
+                "cert/key mismatch: the certificate does not certify the supplied private key"
+                    .into(),
+            ));
+        }
+
         let peer_id = peer_id_from_tls_spki_der(&spki_der);
         Ok(Self {
             cert_pem,
-            key_pem: Zeroizing::new(key_pem),
+            key_pem,
             cert_der,
             key_der: Zeroizing::new(key_der),
             spki_der,
@@ -188,6 +319,125 @@ impl NodeCert {
         PrivateKeyDer::try_from(self.key_der.to_vec())
             .expect("a freshly serialized PKCS#8 key is always a valid PrivateKeyDer")
     }
+}
+
+/// Load the RETIRING (previous) identity persisted by [`NodeCert::rotate`], if a `.prev` slot exists.
+///
+/// Lets a caller resume dual-presenting the old `peer_id` after a restart that happened mid-overlap
+/// (before [`retire_previous`] ran). Returns `Ok(None)` when no `.prev` slot is present.
+pub fn load_previous(dir: impl AsRef<Path>) -> Result<Option<NodeCert>> {
+    let dir = dir.as_ref();
+    let cert_path = dir.join(CERT_FILE_PREV);
+    let key_path = dir.join(KEY_FILE_PREV);
+    if !cert_path.exists() || !key_path.exists() {
+        return Ok(None);
+    }
+    let cert_pem = fs::read_to_string(&cert_path)?;
+    let key_pem = fs::read_to_string(&key_path)?;
+    Ok(Some(NodeCert::from_pem(&cert_pem, &key_pem)?))
+}
+
+/// Retire the previous identity: ZEROIZE the in-memory copy of the old key and delete both `.prev`
+/// files. Call this only AFTER the caller's re-announce of the new `peer_id` has converged, since it
+/// makes the old identity permanently unrecoverable. A no-op (returns `Ok(())`) when no `.prev` slot
+/// exists, so it is safe to call unconditionally.
+pub fn retire_previous(dir: impl AsRef<Path>) -> Result<()> {
+    let dir = dir.as_ref();
+    let cert_path = dir.join(CERT_FILE_PREV);
+    let key_path = dir.join(KEY_FILE_PREV);
+    if key_path.exists() {
+        // Read the old key into a scrubbing buffer and let it drop: this zeroizes the plaintext key
+        // bytes in our address space. (Portable filesystems cannot guarantee the on-disk blocks are
+        // physically overwritten; deleting the file is the strongest cross-platform guarantee.)
+        drop(Zeroizing::new(fs::read(&key_path)?));
+        fs::remove_file(&key_path)?;
+    }
+    if cert_path.exists() {
+        fs::remove_file(&cert_path)?;
+    }
+    Ok(())
+}
+
+/// Whether an [`atomic_write`] target holds secret key material (created `0600` / ACL-hardened) or a
+/// public certificate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Secret {
+    Yes,
+    No,
+}
+
+/// Read a private-key PEM file into a scrubbing buffer so the intermediate plaintext PEM never lands
+/// in a plain, non-zeroized `String` that lingers on the heap after use.
+fn read_key_to_zeroizing(path: &Path) -> Result<Zeroizing<String>> {
+    Ok(Zeroizing::new(fs::read_to_string(path)?))
+}
+
+/// The sibling temporary path an [`atomic_write`] stages `dest` through (e.g. `node.key.tmp`).
+fn tmp_path(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+/// Durably and atomically write `contents` to `dest`: stage a sibling `.tmp`, fsync its bytes, rename
+/// it over `dest` (an atomic same-directory replace), then fsync the parent directory so the rename
+/// itself survives a crash. A `Secret::Yes` target's tmp file is created owner-only `0600` (Unix) /
+/// ACL-hardened (Windows) via [`write_key_file`], so key material is never briefly world-readable even
+/// in the staging file. This replaces the old in-place truncate-then-write, which could leave a torn
+/// (partially written / truncated) current slot if the process died mid-write.
+fn atomic_write(dest: &Path, contents: &[u8], secret: Secret) -> Result<()> {
+    let tmp = tmp_path(dest);
+    match secret {
+        Secret::Yes => write_key_file(&tmp, contents)?,
+        Secret::No => fs::write(&tmp, contents)?,
+    }
+    // Flush the staged bytes to stable storage BEFORE the rename exposes them as `dest`.
+    fs::OpenOptions::new().write(true).open(&tmp)?.sync_all()?;
+    atomic_rename(&tmp, dest)?;
+    if let Some(parent) = dest.parent() {
+        fsync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// Atomically replace `to` with `from`. POSIX `rename(2)` is atomic within a directory and replaces an
+/// existing destination in one step.
+#[cfg(unix)]
+fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
+    fs::rename(from, to)?;
+    Ok(())
+}
+
+/// Atomically replace `to` with `from` on Windows. `fs::rename` maps to `MoveFileExW` with
+/// `REPLACE_EXISTING` on modern Rust, but historically failed when the destination existed; fall back
+/// to remove-then-rename in that case. The staged `.tmp` still holds the full new contents throughout,
+/// so a crash in the sub-millisecond window between remove and rename is recovered on the next write.
+#[cfg(windows)]
+fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) if to.exists() => {
+            fs::remove_file(to)?;
+            fs::rename(from, to)?;
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Fsync a directory so a rename into it is durable (POSIX: an fsync of the file's data does not
+/// guarantee the directory entry is on stable storage).
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> Result<()> {
+    fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Windows cannot fsync a directory handle the POSIX way; `MoveFileExW` with `WRITE_THROUGH` semantics
+/// makes the rename durable on its own, so there is nothing further to do here.
+#[cfg(windows)]
+fn fsync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Restrict `dir` to owner-only access (`0700`) before any secret is written into it.
@@ -337,6 +587,207 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(key_mode, 0o600, "private key file must be owner-only");
+    }
+
+    fn bls_pub_in_cert(cert_der: &[u8]) -> [u8; 48] {
+        match verify_binding_from_leaf_cert(cert_der) {
+            BindingOutcome::Bound { bls_pub } => bls_pub,
+            other => panic!("expected Bound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rotate_yields_a_new_peer_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = NodeCert::load_or_generate(dir.path(), &bls_sk("rotate/before")).unwrap();
+        let old_peer_id = before.peer_id();
+        drop(before);
+
+        let rotated = NodeCert::rotate(dir.path(), &bls_sk("rotate/after")).unwrap();
+        assert_eq!(rotated.previous().peer_id(), old_peer_id);
+        assert_ne!(
+            rotated.current().peer_id(),
+            old_peer_id,
+            "rotation mints a fresh key, so the peer_id changes"
+        );
+    }
+
+    #[test]
+    fn rotate_returns_two_valid_spki_bound_certs() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_sk = bls_sk("rotate/valid-old");
+        let new_sk = bls_sk("rotate/valid-new");
+        NodeCert::load_or_generate(dir.path(), &old_sk).unwrap();
+
+        let rotated = NodeCert::rotate(dir.path(), &new_sk).unwrap();
+
+        // Each cert's peer_id is SHA-256 of its own SPKI...
+        for node in [rotated.previous(), rotated.current()] {
+            let expected: [u8; 32] = Sha256::digest(node.spki_der()).into();
+            assert_eq!(node.peer_id().as_bytes(), &expected);
+        }
+        // ...and each carries a valid binding to the RIGHT BLS key.
+        assert_eq!(
+            bls_pub_in_cert(rotated.previous().cert_der()),
+            public_key_bytes(&old_sk)
+        );
+        assert_eq!(
+            bls_pub_in_cert(rotated.current().cert_der()),
+            public_key_bytes(&new_sk)
+        );
+    }
+
+    #[test]
+    fn rotate_persists_current_and_previous_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        NodeCert::load_or_generate(dir.path(), &bls_sk("rotate/persist-old")).unwrap();
+        let rotated = NodeCert::rotate(dir.path(), &bls_sk("rotate/persist-new")).unwrap();
+
+        // The current slot now holds the NEW identity...
+        let reloaded = NodeCert::load_or_generate(dir.path(), &bls_sk("unused")).unwrap();
+        assert_eq!(reloaded.peer_id(), rotated.current().peer_id());
+        // ...and the additive .prev slot holds the OLD identity, reloadable across a restart.
+        let prev = load_previous(dir.path())
+            .unwrap()
+            .expect("a .prev slot exists after rotate");
+        assert_eq!(prev.peer_id(), rotated.previous().peer_id());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rotate_persists_both_keys_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        NodeCert::load_or_generate(dir.path(), &bls_sk("rotate/perm-old")).unwrap();
+        NodeCert::rotate(dir.path(), &bls_sk("rotate/perm-new")).unwrap();
+
+        for f in [KEY_FILE, KEY_FILE_PREV] {
+            let mode = fs::metadata(dir.path().join(f))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{f} must be owner-only after rotate");
+        }
+    }
+
+    #[test]
+    fn retire_previous_deletes_the_prev_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        NodeCert::load_or_generate(dir.path(), &bls_sk("retire/old")).unwrap();
+        let rotated = NodeCert::rotate(dir.path(), &bls_sk("retire/new")).unwrap();
+        let current_peer_id = rotated.current().peer_id();
+
+        retire_previous(dir.path()).unwrap();
+
+        assert!(
+            !dir.path().join(CERT_FILE_PREV).exists(),
+            "prev cert deleted"
+        );
+        assert!(!dir.path().join(KEY_FILE_PREV).exists(), "prev key deleted");
+        assert!(
+            load_previous(dir.path()).unwrap().is_none(),
+            "no .prev after retire"
+        );
+        // The current identity is untouched by retirement.
+        let reloaded = NodeCert::load_or_generate(dir.path(), &bls_sk("unused")).unwrap();
+        assert_eq!(reloaded.peer_id(), current_peer_id);
+    }
+
+    #[test]
+    fn retire_previous_is_a_noop_without_a_prev_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        NodeCert::load_or_generate(dir.path(), &bls_sk("retire/noop")).unwrap();
+        // No rotation has happened; retiring is safe and idempotent.
+        retire_previous(dir.path()).unwrap();
+        retire_previous(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn rotate_requires_an_existing_current_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        // Empty dir — nothing to rotate.
+        assert!(NodeCert::rotate(dir.path(), &bls_sk("rotate/empty")).is_err());
+    }
+
+    #[test]
+    fn load_previous_is_none_for_a_pre_rotate_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        NodeCert::load_or_generate(dir.path(), &bls_sk("prev/none")).unwrap();
+        assert!(load_previous(dir.path()).unwrap().is_none());
+    }
+
+    /// §5.1 additive guarantee: a dir written by a PRE-rotation reader (only `node.crt`/`node.key`,
+    /// no `.prev` slot) still loads unchanged, and `load_previous` reports no previous identity.
+    #[test]
+    fn old_single_cert_dir_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let sk = bls_sk("compat/single");
+        let original = NodeCert::load_or_generate(dir.path(), &sk).unwrap();
+        let original_peer_id = original.peer_id();
+        drop(original);
+
+        // Exactly the two files an old writer produced; assert no .prev exists.
+        assert!(!dir.path().join(CERT_FILE_PREV).exists());
+        assert!(load_previous(dir.path()).unwrap().is_none());
+
+        let reloaded = NodeCert::load_or_generate(dir.path(), &sk).unwrap();
+        assert_eq!(
+            reloaded.peer_id(),
+            original_peer_id,
+            "old single-cert dir loads identically"
+        );
+    }
+
+    /// Defense-in-depth regression: a cert paired with the WRONG private key (their SPKIs differ) is
+    /// rejected on load, never silently accepted — otherwise a peer would pin a `peer_id` derived from
+    /// a key the presented certificate does not certify.
+    #[test]
+    fn from_pem_rejects_a_mismatched_cert_and_key() {
+        let ca = test_ca();
+        let a = NodeCert::generate_signed_by(&ca, &bls_sk("mismatch/a"), OffsetDateTime::now_utc())
+            .unwrap();
+        let b = NodeCert::generate_signed_by(&ca, &bls_sk("mismatch/b"), OffsetDateTime::now_utc())
+            .unwrap();
+
+        // A's certificate paired with B's key — two independent key pairs, so the cert does not
+        // certify the key.
+        let err = NodeCert::from_pem(a.cert_pem(), b.key_pem())
+            .expect_err("a mismatched cert+key pair must be rejected");
+        assert!(matches!(err, DigTlsError::Parse(_)), "got {err:?}");
+
+        // The matching pairs still load fine.
+        assert!(NodeCert::from_pem(a.cert_pem(), a.key_pem()).is_ok());
+        assert!(NodeCert::from_pem(b.cert_pem(), b.key_pem()).is_ok());
+    }
+
+    /// Double-rotate guard: rotating again while a `.prev` slot is still un-retired must error, so an
+    /// in-overlap retiring identity is never silently overwritten. After `retire_previous`, rotation
+    /// succeeds again.
+    #[test]
+    fn rotate_twice_without_retiring_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        NodeCert::load_or_generate(dir.path(), &bls_sk("double/old")).unwrap();
+
+        let first = NodeCert::rotate(dir.path(), &bls_sk("double/one")).unwrap();
+        let first_current = first.current().peer_id();
+        drop(first);
+
+        // A second rotation with the .prev slot still populated is refused...
+        let err = NodeCert::rotate(dir.path(), &bls_sk("double/two"))
+            .expect_err("a second rotation before retiring the first must error");
+        assert!(matches!(err, DigTlsError::CertGen(_)), "got {err:?}");
+
+        // ...and the current slot is untouched by the refused attempt.
+        let reloaded = NodeCert::load_or_generate(dir.path(), &bls_sk("unused")).unwrap();
+        assert_eq!(reloaded.peer_id(), first_current);
+        drop(reloaded);
+
+        // After retiring the previous identity, rotation is permitted again.
+        retire_previous(dir.path()).unwrap();
+        let second = NodeCert::rotate(dir.path(), &bls_sk("double/three")).unwrap();
+        assert_eq!(second.previous().peer_id(), first_current);
+        assert_ne!(second.current().peer_id(), first_current);
     }
 
     #[test]
