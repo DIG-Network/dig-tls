@@ -61,4 +61,4 @@ pub use binding::BindingPolicy;
 pub use config::{client_config, server_config, ClientTls, ServerTls};
 pub use error::{DigTlsError, Result};
 pub use identity::{peer_id_from_leaf_cert_der, peer_id_from_tls_spki_der, PeerId};
-pub use node_cert::NodeCert;
+pub use node_cert::{load_previous, retire_previous, NodeCert, RotatedNodeCert};

@@ -40,6 +40,44 @@ const LEAF_SAN: &str = "peer.dig";
 const CERT_FILE: &str = "node.crt";
 const KEY_FILE: &str = "node.key";
 
+/// The on-disk file names for the RETIRING (previous) cert + key, written by [`NodeCert::rotate`] and
+/// deleted by [`retire_previous`]. These are NEW, additive files — the current identity always stays
+/// in [`CERT_FILE`]/[`KEY_FILE`], so a reader that predates rotation still loads unchanged (§5.1).
+const CERT_FILE_PREV: &str = "node.crt.prev";
+const KEY_FILE_PREV: &str = "node.key.prev";
+
+/// The outcome of a machine-key rotation ([`NodeCert::rotate`]): the retiring `previous` identity and
+/// the freshly minted `current` one.
+///
+/// Because `peer_id = SHA-256(SPKI DER)` and the SPKI commits the BLS binding, a rotation mints a
+/// brand-new key pair and therefore a brand-new `peer_id` — this is an IDENTITY CHANGE, not a cert
+/// renewal. dig-tls is a library and does NOT do networking; it hands back BOTH identities so the
+/// CALLER (dig-node) can dual-present — keep accepting inbound on the old `peer_id` while it
+/// re-announces the new `peer_id` to DHT/PEX/relay — then call [`retire_previous`] once the
+/// re-announce converges.
+pub struct RotatedNodeCert {
+    previous: NodeCert,
+    current: NodeCert,
+}
+
+impl RotatedNodeCert {
+    /// The retiring identity. Present it (and accept inbound on its `peer_id`) during the overlap
+    /// window, until the caller's re-announce converges and it calls [`retire_previous`].
+    pub fn previous(&self) -> &NodeCert {
+        &self.previous
+    }
+
+    /// The freshly minted identity to advertise going forward.
+    pub fn current(&self) -> &NodeCert {
+        &self.current
+    }
+
+    /// Consume the rotation, keeping only the new current identity (drops + scrubs the previous key).
+    pub fn into_current(self) -> NodeCert {
+        self.current
+    }
+}
+
 /// A peer's mTLS identity certificate + private key, plus its derived `peer_id`.
 ///
 /// The private key is held in [`Zeroizing`] so every clone/drop scrubs the plaintext PKCS#8 bytes
@@ -124,6 +162,24 @@ impl NodeCert {
         Ok(node)
     }
 
+    /// Rotate this peer's machine key: mint a FRESH `(TLS leaf, cert)` bound to `new_bls_sk`, persist
+    /// it as the new current identity, and demote the existing on-disk pair to the additive `.prev`
+    /// slot — WITHOUT losing it — so the caller can dual-present during the overlap window.
+    ///
+    /// The new leaf key means a new SPKI and therefore a new `peer_id`: rotation is an IDENTITY
+    /// CHANGE (see [`RotatedNodeCert`]). The caller mints the new BLS identity secret in dig-identity
+    /// and passes it in here; dig-tls never derives or stores a BLS key (mirroring
+    /// [`Self::generate_signed`]). Cert-EXPIRY renewal under the SAME key is a separate, cheaper path
+    /// — reissue with [`Self::generate_signed`] using the existing BLS secret; the `peer_id` is
+    /// preserved only when the SAME TLS leaf key is reused, which this rotation deliberately is NOT.
+    ///
+    /// The existing `dir` MUST already hold a current cert + key (rotation replaces a live identity).
+    /// The persisted key files stay owner-only `0600` (see [`write_key_file`]).
+    pub fn rotate(dir: impl AsRef<Path>, new_bls_sk: &SecretKey) -> Result<RotatedNodeCert> {
+        let _ = (dir, new_bls_sk);
+        Err(DigTlsError::CertGen("rotate: not yet implemented".into()))
+    }
+
     /// Reconstruct a [`NodeCert`] from persisted PEM (its cert + private key).
     pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self> {
         let key = KeyPair::from_pem(key_pem)
@@ -188,6 +244,24 @@ impl NodeCert {
         PrivateKeyDer::try_from(self.key_der.to_vec())
             .expect("a freshly serialized PKCS#8 key is always a valid PrivateKeyDer")
     }
+}
+
+/// Load the RETIRING (previous) identity persisted by [`NodeCert::rotate`], if a `.prev` slot exists.
+///
+/// Lets a caller resume dual-presenting the old `peer_id` after a restart that happened mid-overlap
+/// (before [`retire_previous`] ran). Returns `Ok(None)` when no `.prev` slot is present.
+pub fn load_previous(dir: impl AsRef<Path>) -> Result<Option<NodeCert>> {
+    let _ = dir;
+    Err(DigTlsError::CertGen("load_previous: not yet implemented".into()))
+}
+
+/// Retire the previous identity: ZEROIZE the in-memory copy of the old key and delete both `.prev`
+/// files. Call this only AFTER the caller's re-announce of the new `peer_id` has converged, since it
+/// makes the old identity permanently unrecoverable. A no-op (returns `Ok(())`) when no `.prev` slot
+/// exists, so it is safe to call unconditionally.
+pub fn retire_previous(dir: impl AsRef<Path>) -> Result<()> {
+    let _ = dir;
+    Err(DigTlsError::CertGen("retire_previous: not yet implemented".into()))
 }
 
 /// Restrict `dir` to owner-only access (`0700`) before any secret is written into it.
@@ -337,6 +411,22 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(key_mode, 0o600, "private key file must be owner-only");
+    }
+
+    #[test]
+    fn rotate_yields_a_new_peer_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = NodeCert::load_or_generate(dir.path(), &bls_sk("rotate/before")).unwrap();
+        let old_peer_id = before.peer_id();
+        drop(before);
+
+        let rotated = NodeCert::rotate(dir.path(), &bls_sk("rotate/after")).unwrap();
+        assert_eq!(rotated.previous().peer_id(), old_peer_id);
+        assert_ne!(
+            rotated.current().peer_id(),
+            old_peer_id,
+            "rotation mints a fresh key, so the peer_id changes"
+        );
     }
 
     #[test]
