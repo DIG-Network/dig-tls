@@ -55,6 +55,19 @@ orchestrates the network overlap and re-announce.
   `node.key`; the retiring identity is written to NEW `node.crt.prev` / `node.key.prev` files. A
   reader that predates rotation still loads a single-cert directory unchanged, and `load_previous`
   reports no previous identity for such a directory. Key files stay owner-only (`0600`).
+- All persisted slot writes (current AND `.prev`, both `rotate` and `load_or_generate`) are ATOMIC and
+  durable: the bytes are staged to a sibling `<name>.tmp`, fsynced, atomically renamed over the target,
+  and the parent directory is fsynced. A crash at any point therefore leaves EITHER the intact prior
+  contents or the intact new contents of a slot — never a torn or truncated half-write. A secret key's
+  `.tmp` is created owner-only (`0600`) so key material is never briefly world-readable even while staged.
+- `rotate` refuses (returns an error, leaving disk untouched) when a `.prev` slot is already present:
+  an un-retired previous identity means a prior rotation is still mid-overlap, so the caller MUST
+  `retire_previous` before rotating again — one `.prev` generation exists at a time and an in-overlap
+  identity is never silently overwritten.
+- `from_pem` / `from_parts` enforce cert⇔key consistency: a loaded certificate MUST certify the SAME
+  public key the private key holds (SubjectPublicKeyInfo DER equal). A mismatched cert+key pair is
+  REJECTED (a `Parse` error), never loaded — so a peer never pins a `peer_id` for a key its presented
+  certificate does not carry.
 - `load_previous(dir)` reloads the `.prev` identity after a restart that happened mid-overlap;
   `retire_previous(dir)` zeroizes the in-memory copy of the old key and deletes both `.prev` files
   once the caller's re-announce has converged (a no-op when no `.prev` slot exists).
