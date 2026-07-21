@@ -214,6 +214,13 @@ impl DigServerCertVerifier {
     /// proof-of-possession + the #1204 BLS binding (see `require_ca_chain`). Use this to dial the
     /// self-signed peers on the live network (#1422); the CA-requiring [`Self::new`] stays for the
     /// deferred #1378 DIG-CA-everywhere migration.
+    ///
+    /// **SAFETY / USAGE CONTRACT:** Unlike CA mode (where accept-any at least enforces the DIG trust
+    /// domain), SPKI-pinned mode drops the CA check, so passing `expected: None` together with a
+    /// non-`Required` `BindingPolicy` authenticates NOTHING about which peer answered — any peer
+    /// presenting any self-signed leaf is accepted, and an active MITM is undetectable. A dialer MUST
+    /// pass `expected: Some(peer_id)` (or use `BindingPolicy::Required`) to authenticate the specific
+    /// peer. See #1422 / #1371.
     pub fn new_spki_pinned(
         expected: Option<PeerId>,
         captured: CapturedPeerId,

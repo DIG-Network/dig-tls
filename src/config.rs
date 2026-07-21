@@ -141,6 +141,13 @@ pub fn server_config_spki_pinned(
 /// This is dig-nat's auto-dialer entry point for the live network's self-signed peers (#1422; #1378
 /// CA-everywhere deferred; mirrors dig-gossip #1371). Read [`ClientTls::captured_peer_id`] after the
 /// handshake to learn who answered.
+///
+/// **SAFETY / USAGE CONTRACT:** Unlike CA mode (where accept-any at least enforces the DIG trust
+/// domain), SPKI-pinned mode drops the CA check, so passing `expected: None` together with a
+/// non-`Required` `BindingPolicy` authenticates NOTHING about which peer answered — any peer
+/// presenting any self-signed leaf is accepted, and an active MITM is undetectable. A dialer MUST
+/// pass `expected: Some(peer_id)` (or use `BindingPolicy::Required`) to authenticate the specific
+/// peer. See #1422 / #1371.
 pub fn client_config_spki_pinned(
     node: &NodeCert,
     expected: Option<PeerId>,
