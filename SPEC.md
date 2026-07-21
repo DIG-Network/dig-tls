@@ -126,6 +126,23 @@ explicitly (so a consumer never installs a process-default provider).
   by hostname, so the same verifier logic serves both directions.
 - Chain validation accepts ECDSA P-256/P-384 signature algorithms.
 
+### 5.1 SPKI-pinned mode (CA-agnostic)
+
+There are TWO verifier modes, differing ONLY in whether the CA-chain step runs:
+
+- **CA-requiring** (`server_config` / `client_config`, `Dig*CertVerifier::new`): the leaf MUST chain
+  to the DigNetwork CA (above) — the fully-migrated trust domain.
+- **SPKI-pinned** (`server_config_spki_pinned` / `client_config_spki_pinned`,
+  `Dig*CertVerifier::new_spki_pinned`): the CA-chain step is SKIPPED, so a SELF-SIGNED (or foreign-CA)
+  leaf is accepted. Every OTHER check is unchanged — `peer_id = SHA-256(SPKI DER)` pinning, rustls
+  proof-of-possession (the handshake signature rustls verifies regardless), and the #1204 BLS binding
+  under the configured policy. Dropping the CA chain removes only the trust-domain marker, NOT
+  identity or possession.
+
+SPKI-pinned mode exists because DIG peers on the live network still present self-signed / chia-ssl
+leaves (the DIG-CA-everywhere migration is deferred); the CA-requiring mode would reject every legit
+peer with `UnknownIssuer`. dig-nat's auto-dialer uses the SPKI-pinned configs.
+
 ## 6. Security properties (testable)
 
 1. A leaf signed by the DigNetwork CA is accepted; a leaf signed by any other CA is rejected (chain).
@@ -133,6 +150,10 @@ explicitly (so a consumer never installs a process-default provider).
 3. The BLS binding round-trips: a valid binding is captured; a substituted pubkey, a binding replayed
    onto a different SPKI, and a small-subgroup point are all rejected (§4 anti-substitution).
 4. Under `Required`, a CA-signed but UNBOUND leaf is rejected (anti-downgrade).
+5. In SPKI-pinned mode, a self-signed leaf that does NOT chain to the DigNetwork CA is accepted and
+   its `peer_id` captured, while the CA-requiring mode rejects the SAME leaf on the chain; a wrong
+   `peer_id` pin is still rejected, and under `Required` an unbound self-signed leaf is still rejected
+   (§5.1).
 
 ## 7. Hierarchy & dependencies
 
