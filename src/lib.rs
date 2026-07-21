@@ -58,7 +58,10 @@ pub mod verify;
 // crate root so a caller need not know the internal module split (§6.2 LLM-lookup surface). ---
 
 pub use binding::BindingPolicy;
-pub use config::{client_config, server_config, ClientTls, ServerTls};
+pub use config::{
+    client_config, client_config_spki_pinned, server_config, server_config_spki_pinned, ClientTls,
+    ServerTls,
+};
 pub use error::{DigTlsError, Result};
 pub use identity::{peer_id_from_leaf_cert_der, peer_id_from_tls_spki_der, PeerId};
 pub use node_cert::{load_previous, retire_previous, NodeCert, RotatedNodeCert};

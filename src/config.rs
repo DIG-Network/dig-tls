@@ -98,3 +98,79 @@ pub fn client_config(
         captured_bls,
     })
 }
+
+/// Build an inbound (server) mTLS config exactly like [`server_config`], EXCEPT it does not require
+/// the connecting client's leaf to chain to the DigNetwork CA — it accepts a SELF-SIGNED leaf and
+/// authenticates it by `peer_id = SHA-256(SPKI DER)` + rustls proof-of-possession + the #1204 BLS
+/// binding (under `binding_policy`).
+///
+/// Use this on the live network, where DIG peers still present self-signed / chia-ssl certs (the
+/// DIG-CA-everywhere migration #1378 is deferred), so the CA-requiring [`server_config`] would reject
+/// every legit peer with `UnknownIssuer` (#1422; mirrors dig-gossip #1371). Read
+/// [`ServerTls::captured_peer_id`] after the handshake to learn who connected.
+pub fn server_config_spki_pinned(
+    node: &NodeCert,
+    binding_policy: BindingPolicy,
+) -> Result<ServerTls> {
+    let captured_peer_id = CapturedPeerId::default();
+    let captured_bls = CapturedBlsPub::default();
+    let verifier = Arc::new(DigClientCertVerifier::new_spki_pinned(
+        None,
+        captured_peer_id.clone(),
+        binding_policy,
+        captured_bls.clone(),
+    ));
+    let config = ServerConfig::builder_with_provider(ring_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| DigTlsError::RustlsConfig(format!("protocol versions: {e}")))?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(node.rustls_cert_chain(), node.rustls_private_key())
+        .map_err(|e| DigTlsError::RustlsConfig(format!("server single cert: {e}")))?;
+    Ok(ServerTls {
+        config: Arc::new(config),
+        captured_peer_id,
+        captured_bls,
+    })
+}
+
+/// Build an outbound (client) mTLS config exactly like [`client_config`], EXCEPT it does not require
+/// the server's leaf to chain to the DigNetwork CA — it accepts a SELF-SIGNED leaf and authenticates
+/// it by `peer_id = SHA-256(SPKI DER)` pinning of `expected` (or accept-any when `None`) + rustls
+/// proof-of-possession + the #1204 BLS binding (under `binding_policy`).
+///
+/// This is dig-nat's auto-dialer entry point for the live network's self-signed peers (#1422; #1378
+/// CA-everywhere deferred; mirrors dig-gossip #1371). Read [`ClientTls::captured_peer_id`] after the
+/// handshake to learn who answered.
+///
+/// **SAFETY / USAGE CONTRACT:** Unlike CA mode (where accept-any at least enforces the DIG trust
+/// domain), SPKI-pinned mode drops the CA check, so passing `expected: None` together with a
+/// non-`Required` `BindingPolicy` authenticates NOTHING about which peer answered — any peer
+/// presenting any self-signed leaf is accepted, and an active MITM is undetectable. A dialer MUST
+/// pass `expected: Some(peer_id)` (or use `BindingPolicy::Required`) to authenticate the specific
+/// peer. See #1422 / #1371.
+pub fn client_config_spki_pinned(
+    node: &NodeCert,
+    expected: Option<PeerId>,
+    binding_policy: BindingPolicy,
+) -> Result<ClientTls> {
+    let captured_peer_id = CapturedPeerId::default();
+    let captured_bls = CapturedBlsPub::default();
+    let verifier = Arc::new(DigServerCertVerifier::new_spki_pinned(
+        expected,
+        captured_peer_id.clone(),
+        binding_policy,
+        captured_bls.clone(),
+    ));
+    let config = ClientConfig::builder_with_provider(ring_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| DigTlsError::RustlsConfig(format!("protocol versions: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(node.rustls_cert_chain(), node.rustls_private_key())
+        .map_err(|e| DigTlsError::RustlsConfig(format!("client auth cert: {e}")))?;
+    Ok(ClientTls {
+        config: Arc::new(config),
+        captured_peer_id,
+        captured_bls,
+    })
+}

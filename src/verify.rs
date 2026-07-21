@@ -163,8 +163,16 @@ fn verify_tls13(
     )
 }
 
-/// Client-side verifier: verifies the SERVER's leaf chains to the DigNetwork CA (serverAuth), pins
-/// its `peer_id`, and checks the BLS binding.
+/// Client-side verifier: verifies the SERVER's leaf, pins its `peer_id`, and checks the BLS binding.
+///
+/// Two modes, selected at construction:
+///
+/// - [`Self::new`] (default) additionally requires the leaf to chain to the shipped DigNetwork CA —
+///   the trust-DOMAIN marker for a fully-migrated DIG network.
+/// - [`Self::new_spki_pinned`] DROPS that CA-chain requirement (see the type-level note on
+///   `require_ca_chain`) while keeping every real authentication check. Used because live DIG peers
+///   present self-signed / chia-ssl leaves today (#1378 CA-everywhere migration deferred), so the
+///   CA-requiring path rejects every legit peer with `UnknownIssuer` (#1422).
 #[derive(Debug)]
 pub struct DigServerCertVerifier {
     expected: Option<PeerId>,
@@ -172,11 +180,19 @@ pub struct DigServerCertVerifier {
     binding_policy: BindingPolicy,
     captured_bls: CapturedBlsPub,
     schemes: Vec<SignatureScheme>,
+    /// When `true`, the presented leaf MUST chain to the shipped DigNetwork CA (the classic mode).
+    /// When `false` (SPKI-pinned mode), the CA-chain step is SKIPPED — but the REAL authentication is
+    /// unchanged: `peer_id = SHA-256(SPKI DER)` pinning + rustls proof-of-possession (the handshake
+    /// signature, which rustls verifies regardless) + the #1204 BLS binding still run. Dropping the
+    /// CA chain only removes the trust-domain marker, not identity; it exists so a self-signed live
+    /// peer (#1378 deferred) is accepted (#1422, mirrors dig-gossip #1371's `CaptureAnyClientCert`).
+    require_ca_chain: bool,
 }
 
 impl DigServerCertVerifier {
-    /// Build a verifier that pins `expected` (or accepts any DigNetwork-CA peer when `None`), captures
-    /// the derived id + BLS pubkey, and applies `binding_policy`.
+    /// Build a verifier that REQUIRES the server leaf to chain to the DigNetwork CA, pins `expected`
+    /// (or accepts any such peer when `None`), captures the derived id + BLS pubkey, and applies
+    /// `binding_policy`.
     pub fn new(
         expected: Option<PeerId>,
         captured: CapturedPeerId,
@@ -189,6 +205,35 @@ impl DigServerCertVerifier {
             binding_policy,
             captured_bls,
             schemes: default_signature_schemes(),
+            require_ca_chain: true,
+        }
+    }
+
+    /// Build a SPKI-PINNED verifier: identical to [`Self::new`] except it does NOT require the server
+    /// leaf to chain to the DigNetwork CA. Authentication still rests on the `peer_id` pin + rustls
+    /// proof-of-possession + the #1204 BLS binding (see `require_ca_chain`). Use this to dial the
+    /// self-signed peers on the live network (#1422); the CA-requiring [`Self::new`] stays for the
+    /// deferred #1378 DIG-CA-everywhere migration.
+    ///
+    /// **SAFETY / USAGE CONTRACT:** Unlike CA mode (where accept-any at least enforces the DIG trust
+    /// domain), SPKI-pinned mode drops the CA check, so passing `expected: None` together with a
+    /// non-`Required` `BindingPolicy` authenticates NOTHING about which peer answered — any peer
+    /// presenting any self-signed leaf is accepted, and an active MITM is undetectable. A dialer MUST
+    /// pass `expected: Some(peer_id)` (or use `BindingPolicy::Required`) to authenticate the specific
+    /// peer. See #1422 / #1371.
+    pub fn new_spki_pinned(
+        expected: Option<PeerId>,
+        captured: CapturedPeerId,
+        binding_policy: BindingPolicy,
+        captured_bls: CapturedBlsPub,
+    ) -> Self {
+        Self {
+            expected,
+            captured,
+            binding_policy,
+            captured_bls,
+            schemes: default_signature_schemes(),
+            require_ca_chain: false,
         }
     }
 }
@@ -202,7 +247,9 @@ impl ServerCertVerifier for DigServerCertVerifier {
         _ocsp_response: &[u8],
         now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, TlsError> {
-        verify_chain_to_dig_ca(end_entity, intermediates, now, KeyUsage::server_auth())?;
+        if self.require_ca_chain {
+            verify_chain_to_dig_ca(end_entity, intermediates, now, KeyUsage::server_auth())?;
+        }
         pin_and_bind(
             end_entity,
             self.expected,
@@ -236,8 +283,14 @@ impl ServerCertVerifier for DigServerCertVerifier {
     }
 }
 
-/// Server-side verifier: verifies the CLIENT's leaf chains to the DigNetwork CA (clientAuth), pins
-/// its `peer_id`, and checks the BLS binding. Client auth is MANDATORY — this is mutual TLS.
+/// Server-side verifier: verifies the CLIENT's leaf, pins its `peer_id`, and checks the BLS binding.
+/// Client auth is MANDATORY — this is mutual TLS.
+///
+/// Two modes, selected at construction — same distinction as [`DigServerCertVerifier`]:
+///
+/// - [`Self::new`] (default) additionally requires the client leaf to chain to the DigNetwork CA.
+/// - [`Self::new_spki_pinned`] drops that requirement (see `require_ca_chain`) so a self-signed live
+///   peer is accepted (#1422; mirrors dig-gossip #1371).
 #[derive(Debug)]
 pub struct DigClientCertVerifier {
     expected: Option<PeerId>,
@@ -246,10 +299,15 @@ pub struct DigClientCertVerifier {
     captured_bls: CapturedBlsPub,
     schemes: Vec<SignatureScheme>,
     root_hints: Vec<DistinguishedName>,
+    /// When `true`, the client leaf MUST chain to the shipped DigNetwork CA. When `false`
+    /// (SPKI-pinned mode) the CA-chain step is SKIPPED, while the `peer_id` pin + rustls
+    /// proof-of-possession + #1204 BLS binding still authenticate the peer — see the matching field
+    /// on [`DigServerCertVerifier`] for the full rationale (#1422 / #1378-deferred / #1371).
+    require_ca_chain: bool,
 }
 
 impl DigClientCertVerifier {
-    /// Build a verifier that requires a client leaf chaining to the DigNetwork CA, pins `expected`
+    /// Build a verifier that REQUIRES a client leaf chaining to the DigNetwork CA, pins `expected`
     /// (or accepts any such peer when `None`), captures the derived id + BLS pubkey, and applies
     /// `binding_policy`.
     pub fn new(
@@ -265,6 +323,28 @@ impl DigClientCertVerifier {
             captured_bls,
             schemes: default_signature_schemes(),
             root_hints: Vec::new(),
+            require_ca_chain: true,
+        }
+    }
+
+    /// Build a SPKI-PINNED verifier: identical to [`Self::new`] except it does NOT require the client
+    /// leaf to chain to the DigNetwork CA. Authentication still rests on the `peer_id` pin + rustls
+    /// proof-of-possession + the #1204 BLS binding (see `require_ca_chain`). Use this to accept the
+    /// self-signed peers on the live network (#1422).
+    pub fn new_spki_pinned(
+        expected: Option<PeerId>,
+        captured: CapturedPeerId,
+        binding_policy: BindingPolicy,
+        captured_bls: CapturedBlsPub,
+    ) -> Self {
+        Self {
+            expected,
+            captured,
+            binding_policy,
+            captured_bls,
+            schemes: default_signature_schemes(),
+            root_hints: Vec::new(),
+            require_ca_chain: false,
         }
     }
 }
@@ -288,7 +368,9 @@ impl ClientCertVerifier for DigClientCertVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> std::result::Result<ClientCertVerified, TlsError> {
-        verify_chain_to_dig_ca(end_entity, intermediates, now, KeyUsage::client_auth())?;
+        if self.require_ca_chain {
+            verify_chain_to_dig_ca(end_entity, intermediates, now, KeyUsage::client_auth())?;
+        }
         pin_and_bind(
             end_entity,
             self.expected,
@@ -406,6 +488,150 @@ mod tests {
             .expect("a bound DIG-CA leaf verifies");
         assert_eq!(captured.get(), Some(node.peer_id()));
         assert_eq!(captured_bls.get(), Some(public_key_bytes(&sk)));
+    }
+
+    /// Mint a TRULY self-signed leaf (no CA — it signs itself) carrying the #1204 binding to
+    /// `label`'s BLS key. This is the shape a live DIG peer presents today (#1378 DIG-CA-everywhere
+    /// deferred): it does NOT chain to the shipped DigNetwork CA. Returns the leaf, its derived
+    /// peer_id, and the BLS pubkey it is bound to.
+    fn self_signed_bound_leaf(label: &str) -> (CertificateDer<'static>, PeerId, [u8; 48]) {
+        let sk = bls_sk(label);
+        let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "peer.dig");
+        params.distinguished_name = dn;
+        params.subject_alt_names = vec![SanType::DnsName(
+            Ia5String::try_from("peer.dig".to_string()).unwrap(),
+        )];
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        crate::binding::attach_binding(&mut params, &leaf_key, &sk);
+        let cert = params.self_signed(&leaf_key).unwrap();
+        let der = CertificateDer::from(cert.der().to_vec());
+        let peer_id = peer_id_from_leaf_cert_der(der.as_ref()).unwrap();
+        (der, peer_id, public_key_bytes(&sk))
+    }
+
+    /// Mint a TRULY self-signed leaf WITHOUT any #1204 binding — the real chia-ssl / self-signed live
+    /// case. Returns the leaf and its derived peer_id.
+    fn self_signed_unbound_leaf() -> (CertificateDer<'static>, PeerId) {
+        let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "peer.dig");
+        params.distinguished_name = dn;
+        params.subject_alt_names = vec![SanType::DnsName(
+            Ia5String::try_from("peer.dig".to_string()).unwrap(),
+        )];
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let cert = params.self_signed(&leaf_key).unwrap();
+        let der = CertificateDer::from(cert.der().to_vec());
+        let peer_id = peer_id_from_leaf_cert_der(der.as_ref()).unwrap();
+        (der, peer_id)
+    }
+
+    /// The SPKI-pinned verifier ACCEPTS a self-signed leaf that does NOT chain to the DigNetwork CA
+    /// and captures `peer_id == SHA-256(SPKI DER)` — while the CA-requiring verifier REJECTS the SAME
+    /// leaf with a "DigNetwork CA" error. Proves the two modes genuinely differ and the CA path is
+    /// intact (#1422 / mirrors dig-gossip #1371).
+    #[test]
+    fn spki_pinned_accepts_self_signed_leaf() {
+        let (leaf, peer_id, _bls) = self_signed_bound_leaf("verify/spki-self-signed");
+
+        // SPKI-pinned mode: accepted, identity captured.
+        let captured = CapturedPeerId::default();
+        let v = DigServerCertVerifier::new_spki_pinned(
+            None,
+            captured.clone(),
+            BindingPolicy::Opportunistic,
+            CapturedBlsPub::default(),
+        );
+        let name = ServerName::try_from("peer.dig").unwrap();
+        v.verify_server_cert(&leaf, &[], &name, &[], UnixTime::now())
+            .expect("SPKI-pinned mode accepts a self-signed leaf");
+        assert_eq!(captured.get(), Some(peer_id));
+
+        // CA-requiring mode: the SAME leaf is rejected at the chain check.
+        let ca_v = DigServerCertVerifier::new(
+            None,
+            CapturedPeerId::default(),
+            BindingPolicy::Opportunistic,
+            CapturedBlsPub::default(),
+        );
+        let err = ca_v
+            .verify_server_cert(&leaf, &[], &name, &[], UnixTime::now())
+            .expect_err("CA-requiring mode rejects a self-signed leaf");
+        assert!(
+            format!("{err}").contains("DigNetwork CA"),
+            "rejected on the chain, not something else: {err}"
+        );
+    }
+
+    /// The identity-equality guard still holds in SPKI-pinned mode: a leaf whose derived peer_id does
+    /// not equal the pinned `expected` is rejected with "peer_id mismatch".
+    #[test]
+    fn spki_pinned_rejects_wrong_peer_id() {
+        let (leaf, _peer_id, _bls) = self_signed_bound_leaf("verify/spki-wrong-pin");
+        let wrong = PeerId::from_bytes([0x22u8; 32]);
+        let v = DigServerCertVerifier::new_spki_pinned(
+            Some(wrong),
+            CapturedPeerId::default(),
+            BindingPolicy::Opportunistic,
+            CapturedBlsPub::default(),
+        );
+        let name = ServerName::try_from("peer.dig").unwrap();
+        let err = v
+            .verify_server_cert(&leaf, &[], &name, &[], UnixTime::now())
+            .expect_err("a wrong-peer_id pin is rejected even in SPKI-pinned mode");
+        assert!(
+            format!("{err}").contains("peer_id mismatch"),
+            "rejected on the pin: {err}"
+        );
+    }
+
+    /// The live case: a self-signed leaf carrying NO #1204 binding (the real chia-ssl peer) is
+    /// ACCEPTED under `Opportunistic` (dig-nat's default) yet REJECTED under `Required` on the binding
+    /// (anti-downgrade preserved) — exercised on the server-side (client-auth) verifier.
+    #[test]
+    fn spki_pinned_live_case_unbound_self_signed_under_opportunistic() {
+        let (leaf, peer_id) = self_signed_unbound_leaf();
+
+        // Opportunistic: accepted, identity captured, no BLS pubkey captured (none present).
+        let captured = CapturedPeerId::default();
+        let captured_bls = CapturedBlsPub::default();
+        let opp = DigClientCertVerifier::new_spki_pinned(
+            None,
+            captured.clone(),
+            BindingPolicy::Opportunistic,
+            captured_bls.clone(),
+        );
+        opp.verify_client_cert(&leaf, &[], UnixTime::now())
+            .expect("Opportunistic accepts an unbound self-signed leaf");
+        assert_eq!(captured.get(), Some(peer_id));
+        assert_eq!(captured_bls.get(), None);
+
+        // Required: rejected on the absent binding (anti-downgrade).
+        let req = DigClientCertVerifier::new_spki_pinned(
+            None,
+            CapturedPeerId::default(),
+            BindingPolicy::Required,
+            CapturedBlsPub::default(),
+        );
+        let err = req
+            .verify_client_cert(&leaf, &[], UnixTime::now())
+            .expect_err("Required rejects an unbound leaf");
+        assert!(
+            format!("{err}").contains("BLS binding"),
+            "rejected on the binding, not the chain: {err}"
+        );
     }
 
     /// A foreign-CA leaf fails the chain check regardless of policy.

@@ -16,7 +16,9 @@ use dig_tls::binding::BindingPolicy;
 use dig_tls::bls::{public_key_bytes, SecretKey};
 use dig_tls::ca::{generate_dig_ca, DigCa};
 use dig_tls::node_cert::NodeCert;
-use dig_tls::{client_config, server_config, PeerId};
+use dig_tls::{
+    client_config, client_config_spki_pinned, server_config, server_config_spki_pinned, PeerId,
+};
 
 fn bls_sk(label: &str) -> SecretKey {
     let seed: [u8; 32] = Sha256::digest(label.as_bytes()).into();
@@ -167,6 +169,154 @@ async fn foreign_ca_server_cert_is_rejected() {
     .await;
 
     assert!(!r.client_ok, "client rejects a foreign-CA server cert");
+}
+
+/// Mint a NodeCert signed by a THROWAWAY foreign CA — a leaf that does NOT chain to the shipped
+/// DigNetwork CA, standing in for the self-signed / chia-ssl identity a live DIG peer presents today
+/// (#1378 CA-everywhere deferred). The SPKI-pinned configs must accept it; the CA-requiring configs
+/// reject it.
+fn foreign_signed_node(label: &str) -> NodeCert {
+    let ca_material = generate_dig_ca(OffsetDateTime::now_utc()).unwrap();
+    let ca = DigCa::from_pem(&ca_material.cert_pem, &ca_material.key_pem).expect("foreign CA");
+    NodeCert::generate_signed_by(&ca, &bls_sk(label), OffsetDateTime::now_utc())
+        .expect("foreign-signed node cert")
+}
+
+/// Run one mutual-TLS handshake using the SPKI-pinned configs (no CA-chain requirement), `expected`
+/// pinning the server's peer_id on the client side.
+async fn run_spki_pinned_handshake(
+    server_node: &NodeCert,
+    client_node: &NodeCert,
+    expected: Option<PeerId>,
+    policy: BindingPolicy,
+) -> HandshakeResult {
+    let server = server_config_spki_pinned(server_node, policy).expect("server config");
+    let client = client_config_spki_pinned(client_node, expected, policy).expect("client config");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().unwrap();
+
+    let acceptor = TlsAcceptor::from(server.config.clone());
+    let server_task = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept tcp");
+        match acceptor.accept(tcp).await {
+            Ok(mut tls) => {
+                let mut buf = [0u8; 1];
+                let _ = tls.read(&mut buf).await;
+                let _ = tls.write_all(b"y").await;
+                true
+            }
+            Err(_) => false,
+        }
+    });
+
+    let connector = TlsConnector::from(client.config.clone());
+    let tcp = TcpStream::connect(addr).await.expect("connect tcp");
+    let name = ServerName::try_from("peer.dig").unwrap();
+    let client_ok = match connector.connect(name, tcp).await {
+        Ok(mut tls) => {
+            let _ = tls.write_all(b"x").await;
+            let mut buf = [0u8; 1];
+            let _ = tls.read(&mut buf).await;
+            true
+        }
+        Err(_) => false,
+    };
+    let server_ok = server_task.await.unwrap_or(false);
+
+    HandshakeResult {
+        client_ok,
+        server_ok,
+        server_saw_client: server.captured_peer_id.get(),
+        client_saw_server: client.captured_peer_id.get(),
+        server_saw_client_bls: server.captured_bls.get(),
+        client_saw_server_bls: client.captured_bls.get(),
+    }
+}
+
+/// The SPKI-pinned happy path: two peers with self-signed (foreign-CA, non-DIG-CA) identities
+/// complete mutual TLS via the SPKI-pinned configs, each captures the other's peer_id, and the
+/// client's peer_id pin holds — proving live self-signed peers connect (#1422).
+#[tokio::test]
+async fn spki_pinned_self_signed_peers_handshake_and_capture_identity() {
+    let server_node = foreign_signed_node("spki/server");
+    let client_node = foreign_signed_node("spki/client");
+
+    let r = run_spki_pinned_handshake(
+        &server_node,
+        &client_node,
+        Some(server_node.peer_id()),
+        BindingPolicy::Opportunistic,
+    )
+    .await;
+
+    assert!(
+        r.client_ok,
+        "client side of the SPKI-pinned handshake succeeded"
+    );
+    assert!(
+        r.server_ok,
+        "server side of the SPKI-pinned handshake succeeded"
+    );
+    assert_eq!(r.server_saw_client, Some(client_node.peer_id()));
+    assert_eq!(r.client_saw_server, Some(server_node.peer_id()));
+}
+
+/// A wrong peer_id pin on the SPKI-pinned client still rejects the connection — the pin remains a
+/// real authentication even without the CA-chain requirement.
+#[tokio::test]
+async fn spki_pinned_peer_id_pin_mismatch_is_rejected() {
+    let server_node = foreign_signed_node("spki/server2");
+    let client_node = foreign_signed_node("spki/client2");
+
+    let wrong = PeerId::from_bytes([0x33u8; 32]);
+    let r = run_spki_pinned_handshake(
+        &server_node,
+        &client_node,
+        Some(wrong),
+        BindingPolicy::Opportunistic,
+    )
+    .await;
+
+    assert!(
+        !r.client_ok,
+        "a peer_id pin mismatch rejects the server (SPKI-pinned)"
+    );
+}
+
+/// The SPKI-pinned server accepts a self-signed client that the CA-requiring server would reject —
+/// the load-bearing behaviour change for #1422.
+#[tokio::test]
+async fn ca_requiring_server_rejects_the_same_self_signed_client_spki_accepts() {
+    let server_node = foreign_signed_node("spki/srv3");
+    let client_node = foreign_signed_node("spki/cli3");
+
+    // CA-requiring config rejects the self-signed client.
+    let ca = run_handshake(
+        &server_node,
+        &client_node,
+        None,
+        BindingPolicy::Opportunistic,
+    )
+    .await;
+    assert!(
+        !ca.server_ok,
+        "CA-requiring server rejects a self-signed client"
+    );
+
+    // SPKI-pinned config accepts it.
+    let spki = run_spki_pinned_handshake(
+        &server_node,
+        &client_node,
+        None,
+        BindingPolicy::Opportunistic,
+    )
+    .await;
+    assert!(
+        spki.server_ok,
+        "SPKI-pinned server accepts the same self-signed client"
+    );
+    assert_eq!(spki.server_saw_client, Some(client_node.peer_id()));
 }
 
 /// Pinning the WRONG peer_id on the client rejects the connection even though the server cert is
