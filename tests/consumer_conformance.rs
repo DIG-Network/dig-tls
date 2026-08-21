@@ -118,26 +118,40 @@ fn canonical_leaf_key_is_ecdsa_p256() {
     );
 }
 
-/// **Property:** the leaf validity window is exactly `LEAF_LIFETIME` plus the one-hour clock-skew
+/// **Property:** the leaf validity window is exactly 3650 days plus the one-hour clock-skew
 /// backdate, and it is live now.
+///
+/// The span is written as a LITERAL rather than derived from [`LEAF_LIFETIME`] on purpose. Deriving
+/// it from the same constant the certificate is built from is circular — both sides move together,
+/// so the assertion holds for any value and pins nothing. Confirmed live: with the expectation read
+/// from the constant, shortening `LEAF_LIFETIME` to nine years left this test green.
 ///
 /// Pinned from both sides — an exact span, not a lower bound — because a bound checked only from
 /// below can only confirm itself. A consumer minting a shorter-lived cert would silently drop peers
 /// mid-session; one minting a longer-lived cert would outlive the rotation model.
 #[test]
 fn canonical_leaf_validity_window_is_exactly_the_published_span() {
+    const LEAF_DAYS: i64 = 3650;
+    const SKEW_BACKDATE_SECS: i64 = 60 * 60;
+    const SECS_PER_DAY: i64 = 24 * 60 * 60;
+
+    // The published constant is itself part of the contract consumers read, so pin it too.
+    assert_eq!(
+        LEAF_LIFETIME.whole_days(),
+        LEAF_DAYS,
+        "the published LEAF_LIFETIME consumers read must stay 3650 days"
+    );
+
     let node = NodeCert::generate_signed(&bls_sk("conformance-window")).expect("mint node cert");
     let (_, x509) = x509_parser::parse_x509_certificate(node.cert_der()).expect("leaf parses");
 
     let not_before = x509.validity().not_before.timestamp();
     let not_after = x509.validity().not_after.timestamp();
-    let skew_backdate = 60 * 60; // one hour, `ca::CLOCK_SKEW_BACKDATE`
-    let expected_span = LEAF_LIFETIME.whole_seconds() + skew_backdate;
 
     assert_eq!(
         not_after - not_before,
-        expected_span,
-        "leaf span must be LEAF_LIFETIME + the clock-skew backdate, exactly"
+        LEAF_DAYS * SECS_PER_DAY + SKEW_BACKDATE_SECS,
+        "leaf span must be 3650 days + the one-hour clock-skew backdate, exactly"
     );
 
     let now = SystemTime::now()
