@@ -12,7 +12,7 @@
 # (a same-level L00 crate). The caller passes its BLS identity secret key in.
 [package]
 name = "dig-tls"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.81.0"
 license = "Apache-2.0 OR MIT"
@@ -50,7 +50,7 @@ time = { version = "0.3", features = ["macros"] }
 # The node/relay BLS12-381 G1 identity crypto — BLS-G2 sign/verify under the Chia AugScheme, done on
 # RAW bytes so dig-tls needs no DIG-crate dependency. dig-identity itself delegates to this exact
 # crate + version; a conformance test pins that the two agree byte-for-byte.
-chia-bls = "0.26"
+chia-bls = "0.36.1"
 # The ONE operation chia-bls does not expose directly: the raw G1 subgroup + non-identity check that
 # rejects a small-subgroup / invalid-curve seal-target key before it is ever trusted (matches
 # dig-identity::g1_subgroup_check verbatim).
