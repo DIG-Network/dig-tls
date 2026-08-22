@@ -48,8 +48,12 @@ rustls-pemfile = "2"
 time = { version = "0.3", features = ["macros"] }
 
 # The node/relay BLS12-381 G1 identity crypto — BLS-G2 sign/verify under the Chia AugScheme, done on
-# RAW bytes so dig-tls needs no DIG-crate dependency. dig-identity itself delegates to this exact
-# crate + version; a conformance test pins that the two agree byte-for-byte.
+# RAW bytes so dig-tls needs no DIG-crate dependency. dig-identity delegates to this exact crate at
+# this exact version, which is what makes the two byte-agree. dig-tls CANNOT pin that with a test
+# of its own — dig-identity is a same-level L00 crate and depending on it would be an illegal
+# upward edge (Appendix B) — so keeping this line equal to dig-identity's is the whole guarantee,
+# and the golden vectors in src/bls.rs pin the bytes this crate produces so a drift is detectable
+# here rather than only at the integration level.
 chia-bls = "0.36.1"
 # The ONE operation chia-bls does not expose directly: the raw G1 subgroup + non-identity check that
 # rejects a small-subgroup / invalid-curve seal-target key before it is ever trusted (matches
