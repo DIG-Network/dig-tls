@@ -143,4 +143,94 @@ mod tests {
             "off-curve junk is rejected"
         );
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Golden byte vectors — the wire-compatibility contract.
+    //
+    // Every test above is a ROUND-TRIP: it signs and verifies with the same backend, so it passes
+    // for any self-consistent implementation and cannot see a change in seed->key derivation, point
+    // compression, or the AugScheme domain separator. These vectors pin the actual BYTES, so a
+    // `chia-bls` uplift that alters any of them fails HERE rather than silently breaking every
+    // already-deployed peer that verifies a binding produced by an older node.
+    //
+    // Captured on chia-bls 0.26 BEFORE the 0.36 uplift. A changed value is a compatibility break,
+    // not a migration detail — re-blessing these to make a bump pass defeats their entire purpose.
+    // ---------------------------------------------------------------------------------------
+
+    /// The message the pinned signatures below are taken over.
+    const GOLDEN_MSG: &[u8] = b"dig-tls golden vector message";
+
+    /// `(label, secret key, compressed G1 public key, compressed AugScheme G2 signature)`.
+    /// The keys are derived from the label, never pasted, so a second implementation reproduces
+    /// them from the label alone rather than trusting a literal.
+    const GOLDEN_VECTORS: &[(&str, &str, &str, &str)] = &[
+        ("golden/peer-a", "2b9b10c104d2c4750cd6d4e649d69869cb9738b153eef7e93613b9ecb453d618", "9072f1915e0f024466afdc24876d4ea13dd1064df5a67495589863bcda39ec621c809d92ba67bf5bd667c6d5b3178529", "96e87a385dc5cfbeb285000c3c22e5ae76356c249f9842bf8cd8d93c6c5e0a858ad2b2b4035760b21abe71d2d6ba169605b8c6867eb25ef70472b2f0b56684fbb91c07031fe916e3a892f8c0c471ade2e4a7338e14ebf328114c676e1153e867"),
+        ("golden/peer-b", "591fdea7194dd3f68d7a62bc76c18edb37aca6a9ab10222971ef8f450e26ecc1", "896df5e5c5cbf071d98233a9189423b589d63edadd92752a49e8df8d65617b2bb492162ab6ff74bf25b7b5ffa8f7fc65", "aea3cbb6ac127c107b9cfa42e940c46697a9d1d6df1ef405f6d3321959780758d9b8e0479c027dea74109bd084703e2211f9f479a82144d9f9c197ccce2d07657242364dd3cad464b30116a8bd6b25e6d58335bb016ee95fc10145fe170102c9"),
+    ];
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn from_hex(s: &str, out: &mut [u8]) {
+        assert_eq!(s.len(), out.len() * 2, "hex literal length mismatch");
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("valid hex literal");
+        }
+    }
+
+    /// What we PRODUCE must not change: derivation, G1 compression, and the G2 signature bytes.
+    #[test]
+    fn golden_vectors_are_byte_identical() {
+        for (label, sk_hex, pk_hex, sig_hex) in GOLDEN_VECTORS {
+            let sk = identity_sk(label);
+            assert_eq!(
+                &to_hex(&sk.to_bytes()),
+                sk_hex,
+                "seed -> secret key derivation drifted for {label}"
+            );
+            assert_eq!(
+                &to_hex(&public_key_bytes(&sk)),
+                pk_hex,
+                "G1 public key encoding drifted for {label}"
+            );
+            assert_eq!(
+                &to_hex(&sign_message(&sk, GOLDEN_MSG)),
+                sig_hex,
+                "AugScheme G2 signature bytes drifted for {label}"
+            );
+        }
+    }
+
+    /// What we ACCEPT must not change either: a signature produced by the older backend still
+    /// verifies. Byte-equality above cannot see a verification-side regression on its own.
+    #[test]
+    fn pinned_signatures_still_verify() {
+        for (label, _, pk_hex, sig_hex) in GOLDEN_VECTORS {
+            let mut pk = [0u8; 48];
+            let mut sig = [0u8; 96];
+            from_hex(pk_hex, &mut pk);
+            from_hex(sig_hex, &mut sig);
+            assert!(
+                verify_signature(&pk, GOLDEN_MSG, &sig),
+                "a signature pinned from the previous backend no longer verifies for {label}"
+            );
+        }
+    }
+
+    /// Regenerate the literals above: `cargo test emit_golden_vectors -- --ignored --nocapture`.
+    /// Only legitimate when INTRODUCING a vector, never to silence a failing one.
+    #[test]
+    #[ignore]
+    fn emit_golden_vectors() {
+        for (label, ..) in GOLDEN_VECTORS {
+            let sk = identity_sk(label);
+            println!(
+                "(\"{label}\", \"{}\", \"{}\", \"{}\"),",
+                to_hex(&sk.to_bytes()),
+                to_hex(&public_key_bytes(&sk)),
+                to_hex(&sign_message(&sk, GOLDEN_MSG))
+            );
+        }
+    }
 }
