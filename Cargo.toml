@@ -33,7 +33,7 @@ rustls-pki-types = "1"
 # dial by IP and authenticate by peer_id + BLS binding, not by hostname). `rustls-webpki` is the same
 # path-validation engine rustls uses internally; we call it directly so the custom verifiers can add
 # peer_id pinning + the BLS binding on top of a real chain-to-CA check.
-webpki = { package = "rustls-webpki", version = "0.102", default-features = false, features = ["ring", "std"] }
+webpki = { package = "rustls-webpki", version = "0.103.16", default-features = false, features = ["ring", "std"] }
 # CA + per-peer leaf issuance. ring provider + PEM (de)serialization + x509-parser re-export — NO
 # aws-lc, matching the ecosystem rustls posture. Also supports the custom-OID extension the #1204 BLS
 # binding needs.
